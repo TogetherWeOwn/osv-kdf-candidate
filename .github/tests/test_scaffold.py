@@ -215,6 +215,37 @@ class PrLintTests(unittest.TestCase):
                     )
                     self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
+    def test_ipv6_documentation_examples_pass_in_pr_and_commit_text(self):
+        for address in ("2001:db8::1", "2001:DB8:0:0:0:0:0:1", "3fff::1",
+                        "::ffff:" + "192.0.2.1"):
+            for text in (address, "https://[" + address + "]/status"):
+                for event in ("pull_request", "push"):
+                    with self.subTest(text=text, event=event):
+                        result = self.lint(
+                            body="## Verification\n- Scaffold documentation example validated locally: " + text,
+                            EVENT=event, COMMITS=json.dumps([
+                                {"message": "ci: add scaffold\n\nExample " + text}
+                            ]),
+                        )
+                        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_colon_delimited_private_ipv6_fails_in_pr_and_commit_text(self):
+        for address in ("fd00::1", "::1", "fe80::1234%eth0", "fc00::",
+                        "fec0::1", "::", "::ffff:7f00:1"):
+            for text in (address + ": OK", "addr:" + address, "addr:" + address + ": OK"):
+                for event in ("pull_request", "push"):
+                    with self.subTest(text=text, event=event):
+                        result = self.lint(
+                            body="## Verification\n- Scaffold validation results recorded locally: " + text,
+                            EVENT=event, COMMITS=json.dumps([
+                                {"message": "ci: add scaffold\n\nValidation " + text}
+                            ]),
+                        )
+                        self.assertNotEqual(result.returncode, 0)
+                        self.assertIn("a private-network address", result.stdout)
+                        if address != "::":
+                            self.assertNotIn(address, result.stdout)
+
     def test_push_scans_private_references_even_in_merge_and_revert_commits(self):
         for message in ("ci: update QAX-" + "123", "ci: update\n\nservice." + "internal",
                         "Merge branch QAX-" + "123", 'Revert "ci: update QAX-' + '123"'):
