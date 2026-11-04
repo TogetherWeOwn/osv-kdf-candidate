@@ -215,6 +215,46 @@ class PrLintTests(unittest.TestCase):
                     )
                     self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
+    def test_public_dotted_tail_ipv6_passes_in_pr_and_commit_text(self):
+        for address in ("2001:4860::169.254.1.2", "2001:4860::192.168.1.2"):
+            for text in (address, address + ".", address + ": OK",
+                         "https://[" + address + "]/status"):
+                for event in ("pull_request", "push"):
+                    with self.subTest(text=text, event=event):
+                        result = self.lint(
+                            body="## Verification\n- Validation passed for " + text,
+                            EVENT=event, COMMITS=json.dumps([
+                                {"message": "ci: add scaffold\n\nSee " + text}
+                            ]),
+                        )
+                        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_dotted_tail_ipv6_does_not_hide_private_endpoints(self):
+        addresses = ("fd00::192.0.2.1", "fe80::192.0.2.1", "::",
+                     "::ffff:192.168.1.2", "::ffff:169.254.1.2", "::ffff:0.0.0.0",
+                     "192.168.1.2", "169.254.1.2", "0.0.0.0",
+                     "service." + "internal", "service." + "local", "local" + "host",
+                     "2001:4860::192.168.1.2." + "internal")
+        for address in addresses:
+            for prefix in ("", "2001:4860::192.168.1.2 "):
+                for event in ("pull_request", "push"):
+                    with self.subTest(address=address, prefix=prefix, event=event):
+                        text = prefix + address
+                        result = self.lint(
+                            body="## Verification\n- Validation passed for " + text,
+                            EVENT=event, COMMITS=json.dumps([
+                                {"message": "ci: add scaffold\n\nSee " + text}
+                            ]),
+                        )
+                        self.assertNotEqual(result.returncode, 0)
+                        self.assertIn("::error", result.stdout)
+                        label = ("the internal host" if "internal" in address or "local" in address
+                                 else "a private-network address")
+                        self.assertIn(label, result.stdout)
+                        if address != "::":
+                            self.assertNotIn(text, result.stdout + result.stderr)
+                            self.assertNotIn(address, result.stdout + result.stderr)
+
     def test_ipv6_documentation_examples_pass_in_pr_and_commit_text(self):
         for address in ("2001:db8::1", "2001:DB8:0:0:0:0:0:1", "3fff::1",
                         "::ffff:" + "192.0.2.1"):

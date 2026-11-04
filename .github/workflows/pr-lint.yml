@@ -118,22 +118,34 @@ jobs:
               require_card = os.environ.get("REQUIRE_CARD_REF") == "true"
               if HAVE_PREFIXES and not require_card and INTERNAL_ID.search(text or ""):
                   hits.append("a tracker id")
-              scrubbed = GITHUB_URL.sub("", text or "")
-              for pat, label in STRICT_FIXED:
-                  value = text if pat is HOST_INTERNAL else scrubbed
-                  if pat.search(value or "") and label not in hits:
-                      hits.append(label)
-              for literal in IPV6_LITERAL.findall(text or "") + IPV4_LITERAL.findall(text or ""):
-                  address = None
+              addresses = []
+              def classify_ipv6(match):
+                  literal = match.group()
+                  # A hostname suffix means this is not a whole address token.
+                  if (text or "")[match.end():].startswith("."):
+                      return literal
                   # Parse intact first: trailing double colons can belong to the address.
                   for candidate in (literal.rstrip("."), literal.rstrip(".").removesuffix(":")):
                       try:
-                          address = ipaddress.ip_address(candidate)
-                          break
+                          address = ipaddress.IPv6Address(candidate)
                       except ValueError:
-                          pass
-                  if address is None:
-                      continue
+                          continue
+                      addresses.append(address)
+                      # Neither independent matcher may reclassify a valid IPv6 tail.
+                      return " " * len(literal)
+                  return literal
+              address_text = IPV6_LITERAL.sub(classify_ipv6, text or "")
+              scrubbed = GITHUB_URL.sub("", text or "")
+              for pat, label in STRICT_FIXED:
+                  value = address_text if pat is HOST_INTERNAL else scrubbed
+                  if pat.search(value or "") and label not in hits:
+                      hits.append(label)
+              for literal in IPV4_LITERAL.findall(address_text):
+                  try:
+                      addresses.append(ipaddress.IPv4Address(literal))
+                  except ValueError:
+                      pass
+              for address in addresses:
                   address = getattr(address, "ipv4_mapped", None) or address
                   if any(address in network for network in PRIVATE_NETWORKS):
                       hits.append("a private-network address")
