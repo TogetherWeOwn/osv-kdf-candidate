@@ -53,11 +53,12 @@ jobs:
           UI_LINK_BARE = re.compile(r"(?<![\w.-])/[A-Z]{2,6}/(issues|agents|projects|approvals|runs)/")
           UI_LINK_HOST = re.compile(r"(?:https?://[^\s/<>()]+|(?<![\w./-])[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+(?::\d+)?)/[A-Z]{2,6}/(issues|agents|projects|approvals|runs)/")
           HOST_INTERNAL = re.compile(r"\b(?:localhost|[a-z0-9-]+\.(?:internal|local)|(?:10|127)\.\d{1,3}\.\d{1,3}\.\d{1,3}|192\.168\.\d{1,3}\.\d{1,3}|172\.(?:1[6-9]|2\d|3[01])\.\d{1,3}\.\d{1,3})\b", re.IGNORECASE)
+          IPV4_LITERAL = re.compile(r"(?<![\w.])(?:\d{1,3}\.){3}\d{1,3}(?!\w)")
           IPV6_LITERAL = re.compile(r"(?<!\w)[0-9a-f:.]*:[0-9a-f:.]*:[0-9a-f:.]*(?:%[\w.~-]+)?(?!\w)", re.IGNORECASE)
           PRIVATE_NETWORKS = tuple(ipaddress.ip_network(cidr) for cidr in (
               "fc00::/7", "fe80::/10", "fec0::/10", "::/128", "::1/128",
               "10.0.0.0/8", "127.0.0.0/8", "169.254.0.0/16",
-              "172.16.0.0/12", "192.168.0.0/16",
+              "172.16.0.0/12", "192.168.0.0/16", "0.0.0.0/32",
           ))
           GITHUB_URL = re.compile(r"(?:https?://|(?<![\w.-]))(?:www\.)?github\.com/[A-Za-z0-9_.~%/\-]*", re.IGNORECASE)
           STRICT_FIXED = [(UI_LINK_BARE, "an instance UI link"), (UI_LINK_HOST, "an instance UI link"), (HOST_INTERNAL, "the internal host")]
@@ -122,18 +123,18 @@ jobs:
                   value = text if pat is HOST_INTERNAL else scrubbed
                   if pat.search(value or "") and label not in hits:
                       hits.append(label)
-              for literal in IPV6_LITERAL.findall(text or ""):
+              for literal in IPV6_LITERAL.findall(text or "") + IPV4_LITERAL.findall(text or ""):
                   address = None
                   # Parse intact first: trailing double colons can belong to the address.
                   for candidate in (literal.rstrip("."), literal.rstrip(".").removesuffix(":")):
                       try:
-                          address = ipaddress.IPv6Address(candidate)
+                          address = ipaddress.ip_address(candidate)
                           break
                       except ValueError:
                           pass
                   if address is None:
                       continue
-                  address = address.ipv4_mapped or address
+                  address = getattr(address, "ipv4_mapped", None) or address
                   if any(address in network for network in PRIVATE_NETWORKS):
                       hits.append("a private-network address")
                       break
@@ -180,14 +181,14 @@ jobs:
               for where, value in (("the title", title), ("the body", body)):
                   if reference_errors(value, where):
                       failed = True
-              if author.endswith("[bot]") and author.startswith(("dependabot", "renovate")):
-                  if header_errors(title):
-                      print(f"::warning::{author} title '{title}' is not conventional.")
-                  sys.exit(1 if failed else 0)
               errs = header_errors(title)
+              if author.endswith("[bot]") and author.startswith(("dependabot", "renovate")):
+                  if errs:
+                      print(f"::warning title=Dependency-bot title::{'; '.join(errs)}. {HELP}")
+                  sys.exit(1 if failed else 0)
               if errs:
                   failed = True
-                  print(f"::error title=PR title::'{title}': {'; '.join(errs)}. {HELP}")
+                  print(f"::error title=PR title::{'; '.join(errs)}. {HELP}")
               text = re.sub(r"<!--.*?-->", "", body, flags=re.S)
               if len(re.sub(r"\s", "", text)) < 40:
                   if strict:
@@ -221,7 +222,7 @@ jobs:
                   errs = header_errors(subject)
                   if errs:
                       failed = True
-                      print(f"::error title=Commit on default branch::{c.get('id', '')[:10]} '{subject}': "
+                      print("::error title=Commit on default branch::"
                             f"{'; '.join(errs)}. Merge PRs with squash and the PR title as the "
                             "commit title.")
           if failed:

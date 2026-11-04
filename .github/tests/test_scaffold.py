@@ -246,6 +246,65 @@ class PrLintTests(unittest.TestCase):
                         if address != "::":
                             self.assertNotIn(address, result.stdout)
 
+    def test_local_and_unspecified_addresses_fail_in_pr_and_commit_text(self):
+        addresses = ("169.254.1.2", "0.0.0.0", "::ffff:0:0", "::ffff:" + "0.0.0.0")
+        for address in addresses:
+            endpoint = "[" + address + "]" if ":" in address else address
+            for text in (address, address + ".", "https://" + endpoint + "/status"):
+                for event in ("pull_request", "push"):
+                    with self.subTest(text=text, event=event):
+                        result = self.lint(
+                            body="## Verification\n- Scaffold validation results recorded locally: " + text,
+                            EVENT=event, COMMITS=json.dumps([
+                                {"message": "ci: add scaffold\n\nValidation " + text}
+                            ]),
+                        )
+                        self.assertNotEqual(result.returncode, 0)
+                        self.assertIn("a private-network address", result.stdout)
+                        self.assertNotIn(address, result.stdout)
+
+    def test_public_and_documentation_ipv4_addresses_pass(self):
+        for address in ("1.1.1.1", "192.0.2.1", "198.51.100.1", "203.0.113.1"):
+            for text in (address, "https://" + address + "/status"):
+                for event in ("pull_request", "push"):
+                    with self.subTest(text=text, event=event):
+                        result = self.lint(
+                            body="## Verification\n- Scaffold documentation example validated locally: " + text,
+                            EVENT=event, COMMITS=json.dumps([
+                                {"message": "ci: add scaffold\n\nExample " + text}
+                            ]),
+                        )
+                        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_invalid_header_diagnostics_do_not_echo_rejected_metadata(self):
+        for private in ("fd00::1", "service." + "internal", "QAX-" + "123"):
+            for title, reason in (("ci: inspect " + private + ".", "ends with a period"),
+                                  ("inspect " + private, "not a Conventional Commits header"),
+                                  ("ci: " + "x" * 100 + " " + private, "chars (max 100)")):
+                for event in ("pull_request", "push"):
+                    with self.subTest(title=title, event=event):
+                        result = self.lint(title=title, EVENT=event, COMMITS=json.dumps([
+                            {"id": "abc123", "message": title}
+                        ]))
+                        self.assertNotEqual(result.returncode, 0)
+                        self.assertIn("Strict internal ref", result.stdout)
+                        self.assertIn(reason, result.stdout)
+                        self.assertNotIn(private, result.stdout + result.stderr)
+                        self.assertNotIn(title, result.stdout + result.stderr)
+
+    def test_bot_header_warnings_do_not_echo_rejected_metadata(self):
+        for author in ("dependabot[bot]", "renovate[bot]"):
+            for private in ("fd00::1", "service." + "internal", "QAX-" + "123"):
+                with self.subTest(author=author, private=private):
+                    title = "ci: inspect " + private + "."
+                    result = self.lint(title=title, AUTHOR=author)
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertIn("::warning", result.stdout)
+                    self.assertIn("ends with a period", result.stdout)
+                    self.assertNotIn(private, result.stdout + result.stderr)
+                    self.assertNotIn(title, result.stdout + result.stderr)
+                    self.assertNotIn(author, result.stdout + result.stderr)
+
     def test_push_scans_private_references_even_in_merge_and_revert_commits(self):
         for message in ("ci: update QAX-" + "123", "ci: update\n\nservice." + "internal",
                         "Merge branch QAX-" + "123", 'Revert "ci: update QAX-' + '123"'):
