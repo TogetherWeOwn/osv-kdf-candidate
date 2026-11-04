@@ -26,6 +26,9 @@ jobs:
       - name: Scan full history
         run: |
           set -euo pipefail
+          # This scaffold uses the scanner's built-in policy, without repository overrides.
+          test ! -e "$GITHUB_WORKSPACE/.gitleaks.toml"
+          test ! -e "$GITHUB_WORKSPACE/.gitleaksignore"
           download_dir=$(mktemp -d "$RUNNER_TEMP/gitleaks-download.XXXXXX")
           bin_dir=$(mktemp -d "$RUNNER_TEMP/gitleaks-bin.XXXXXX")
           curl --fail --silent --show-error --location --retry 2 --max-time 120 \

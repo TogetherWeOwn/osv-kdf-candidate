@@ -1,3 +1,4 @@
+import ast
 import json
 import os
 from pathlib import Path
@@ -6,6 +7,7 @@ import subprocess
 import sys
 import textwrap
 import unittest
+from unittest import mock
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -51,7 +53,7 @@ class CiEvidenceTests(unittest.TestCase):
 
 
 class PrLintTests(unittest.TestCase):
-    def lint(self, title="ci: add scaffold validation", body=None):
+    def lint(self, title="ci: add scaffold validation", body=None, **overrides):
         workflow = (WORKFLOWS / "pr-lint.yml").read_text()
         script = textwrap.dedent(
             workflow.split("python3 - <<'PYEOF'\n", 1)[1].rsplit("          PYEOF", 1)[0]
@@ -66,6 +68,7 @@ class PrLintTests(unittest.TestCase):
             "INTERNAL_ID_LEVEL": "error", "INTERNAL_ID_PREFIXES": "QAX",
             "STRICT_INTERNAL_LEVEL": "error", "PR_STANDARDS_MODE": "error",
         })
+        env.update(overrides)
         return subprocess.run(
             [sys.executable, "-I", "-c", script], env=env,
             capture_output=True, text=True, timeout=5,
@@ -75,6 +78,17 @@ class PrLintTests(unittest.TestCase):
         result = self.lint()
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
+    def test_valid_fix_pr_passes(self):
+        body = ("## Linked Issues or Issue Description\n- Fixes #1 with a public issue link.\n"
+                "## Verification\n- Dependency-free scaffold guard tests passed locally.\n")
+        result = self.lint("fix: repair scaffold validation", body)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_merge_group_checks_supplied_commits_and_allows_empty_payload(self):
+        self.assertEqual(self.lint(EVENT="merge_group", COMMITS="").returncode, 0)
+        result = self.lint(EVENT="merge_group", COMMITS=json.dumps([{"message": "bad subject"}]))
+        self.assertNotEqual(result.returncode, 0)
+
     def test_bad_title_empty_body_and_missing_issue_fail(self):
         for title, body in (("unconventional title", None),
                             ("ci: add scaffold validation", ""),
@@ -83,11 +97,64 @@ class PrLintTests(unittest.TestCase):
                 self.assertNotEqual(self.lint(title, body).returncode, 0)
 
     def test_tracker_and_private_host_text_fail(self):
-        for text in ("QAX-" + "123", "service." + "internal", "local" + "host"):
+        for text in ("QAX-" + "123", "qax-" + "123", "Qax-" + "123",
+                     "service." + "internal", "local" + "host"):
             with self.subTest(text=text):
                 result = self.lint(body="## Verification\n- Validation passed for " + text)
                 self.assertNotEqual(result.returncode, 0)
                 self.assertIn("::error", result.stdout)
+
+    def test_configured_prefixes_allow_public_standard_names(self):
+        result = self.lint(body="## Verification\n- Verified a SHA-" + "256 checksum locally.")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_contradictory_card_reference_setting_fails_closed(self):
+        result = self.lint(body="## Verification\n- Validation passed for QAX-" + "123",
+                           REQUIRE_CARD_REF="true")
+        self.assertNotEqual(result.returncode, 0)
+
+    def test_bot_titles_warn_but_private_references_fail(self):
+        for author in ("dependabot[bot]", "renovate[bot]"):
+            with self.subTest(author=author):
+                self.assertEqual(self.lint(title="dependency update", body="", AUTHOR=author).returncode, 0)
+                self.assertNotEqual(self.lint(body="<!-- service." + "internal -->", AUTHOR=author).returncode, 0)
+                self.assertNotEqual(self.lint(title="ci: update QAX-" + "123", AUTHOR=author).returncode, 0)
+
+    def test_private_text_in_comments_queries_and_addresses_fails(self):
+        addresses = ((10, 1, 2, 3), (172, 16, 1, 2), (192, 168, 1, 2), (127, 0, 0, 1))
+        texts = ["<!-- QAX-" + "123 -->", "<!-- service." + "internal -->",
+                 "https://github.com/org/repo/issues/1?next=service." + "internal/"]
+        texts.extend(".".join(map(str, address)) for address in addresses)
+        for text in texts:
+            with self.subTest(text=text):
+                self.assertNotEqual(self.lint(body="## Verification\n- Validation passed for " + text).returncode, 0)
+        self.assertEqual(self.lint(body="## Verification\n- See https://github.com/org/repo/issues/1").returncode, 0)
+
+    def test_only_exact_template_header_is_exempt(self):
+        workflow = (WORKFLOWS / "pr-lint.yml").read_text()
+        script = textwrap.dedent(
+            workflow.split("python3 - <<'PYEOF'\n", 1)[1].rsplit("          PYEOF", 1)[0]
+        )
+        header = next(ast.literal_eval(node.value) for node in ast.parse(script).body
+                      if isinstance(node, ast.Assign)
+                      and any(isinstance(target, ast.Name) and target.id == "TEMPLATE_HEADER"
+                              for target in node.targets))
+        body = header + "\n## Verification\n- Scaffold validation passed locally.\n"
+        self.assertEqual(self.lint(body=body).returncode, 0)
+        self.assertEqual(self.lint(EVENT="push", COMMITS=json.dumps([
+            {"message": "ci: add scaffold\n\n" + body}
+        ])).returncode, 0)
+        self.assertNotEqual(self.lint(body=body + "<!-- service." + "internal -->").returncode, 0)
+        self.assertNotEqual(self.lint(body=body.replace("Title:", "Title: service." + "internal")).returncode, 0)
+
+    def test_push_scans_private_references_even_in_merge_and_revert_commits(self):
+        for message in ("ci: update QAX-" + "123", "ci: update\n\nservice." + "internal",
+                        "Merge branch QAX-" + "123", 'Revert "ci: update QAX-' + '123"'):
+            with self.subTest(message=message):
+                result = self.lint(EVENT="push", COMMITS=json.dumps([{"id": "abc", "message": message}]))
+                self.assertNotEqual(result.returncode, 0)
+        for message in ("ci: update scaffold", "Merge branch clean", 'Revert "ci: update scaffold"'):
+            self.assertEqual(self.lint(EVENT="push", COMMITS=json.dumps([{"message": message}])).returncode, 0)
 
 
 class WorkflowContractTests(unittest.TestCase):
@@ -113,8 +180,9 @@ class WorkflowContractTests(unittest.TestCase):
 
     def test_ci_has_real_validation_and_always_reports(self):
         text = (WORKFLOWS / "starter-ci.yml").read_text()
-        self.assertIn("if: always()", text)
-        self.assertIn("needs: [lint]", text)
+        ci_job = text.split("\n  ci-ok:\n", 1)[1]
+        self.assertRegex(ci_job, r"(?m)^    if: always\(\)$")
+        self.assertRegex(ci_job, r"(?m)^    needs: \[lint\]$")
         self.assertIn("python3 -I -m unittest discover -s .github/tests -v", text)
         self.assertIn("python3 -I .github/scripts/check_ci.py", text)
         self.assertIn("023070a287cd8cccd71515fedc843f1985bf96c436b7effaecce67290e7e0757", text)
@@ -123,7 +191,8 @@ class WorkflowContractTests(unittest.TestCase):
         self.assertNotIn("goes here", text)
 
     def test_secret_scan_verifies_archive_before_execution(self):
-        text = (WORKFLOWS / "gitleaks.yml").read_text()
+        text = "\n".join(line for line in (WORKFLOWS / "gitleaks.yml").read_text().splitlines()
+                         if not line.lstrip().startswith("#"))
         self.assertIn("gitleaks_8.30.1_linux_x64.tar.gz", text)
         self.assertIn("551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb", text)
         self.assertIn('test "$(wc -c < "$download_dir/gitleaks.tgz")" -eq 8230402', text)
@@ -136,8 +205,39 @@ class WorkflowContractTests(unittest.TestCase):
         text = (WORKFLOWS / "pr-lint.yml").read_text()
         for setting in ('REQUIRE_CARD_REF: "false"', 'INTERNAL_ID_LEVEL: "error"',
                         'STRICT_INTERNAL_LEVEL: "error"', 'PR_STANDARDS_MODE: "error"'):
-            self.assertIn(setting, text)
+            self.assertRegex(text, r"(?m)^  " + re.escape(setting) + r"(?:\s*#.*)?$")
         self.assertNotIn("$default-branch", text)
+
+    def test_comments_cannot_replace_active_workflow_guards(self):
+        cases = (
+            ("starter-ci.yml", "    if: always()", "    # if: always()",
+             self.test_ci_has_real_validation_and_always_reports),
+            ("pr-lint.yml", '  STRICT_INTERNAL_LEVEL: "error"',
+             '  # STRICT_INTERNAL_LEVEL: "error"\n  STRICT_INTERNAL_LEVEL: "warning"',
+             self.test_pr_lint_remains_strict),
+            ("gitleaks.yml", '            "$download_dir/gitleaks.tgz" | sha256sum -c -',
+             '            "$download_dir/gitleaks.tgz"\n          # sha256sum -c -',
+             self.test_secret_scan_verifies_archive_before_execution),
+        )
+        for filename, before, after, check in cases:
+            with self.subTest(filename=filename):
+                text = (WORKFLOWS / filename).read_text()
+                self.assertIn(before, text)
+                with mock.patch.object(Path, "read_text", return_value=text.replace(before, after)):
+                    with self.assertRaises((AssertionError, ValueError)):
+                        check()
+
+    def test_secret_scan_rejects_repository_policy_overrides(self):
+        text = (WORKFLOWS / "gitleaks.yml").read_text()
+        for filename in (".gitleaks.toml", ".gitleaksignore"):
+            guard = 'test ! -e "$GITHUB_WORKSPACE/' + filename + '"'
+            self.assertIn(guard, text)
+            self.assertLess(text.index(guard), text.index('"$bin_dir/gitleaks" detect'))
+
+    def test_manual_and_pr_size_runs_have_separate_groups(self):
+        text = (WORKFLOWS / "pr-size.yml").read_text()
+        self.assertIn("group: ${{ github.workflow }}-${{ github.event_name }}-", text)
+        self.assertRegex(text, r"(?m)^    if: github\.event_name == 'pull_request' \|\| inputs\.pr_number != ''$")
 
 
 if __name__ == "__main__":
