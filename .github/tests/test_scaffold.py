@@ -147,6 +147,44 @@ class PrLintTests(unittest.TestCase):
         self.assertNotEqual(self.lint(body=body + "<!-- service." + "internal -->").returncode, 0)
         self.assertNotEqual(self.lint(body=body.replace("Title:", "Title: service." + "internal")).returncode, 0)
 
+    def test_crlf_template_header_is_exempt_but_added_private_text_is_not(self):
+        workflow = (WORKFLOWS / "pr-lint.yml").read_text()
+        script = textwrap.dedent(
+            workflow.split("python3 - <<'PYEOF'\n", 1)[1].rsplit("          PYEOF", 1)[0]
+        )
+        header = next(ast.literal_eval(node.value) for node in ast.parse(script).body
+                      if isinstance(node, ast.Assign)
+                      and any(isinstance(target, ast.Name) and target.id == "TEMPLATE_HEADER"
+                              for target in node.targets))
+        body = (header + "\n## Verification\n- Scaffold validation passed locally.\n").replace("\n", "\r\n")
+        for event in ("pull_request", "push"):
+            with self.subTest(event=event):
+                def check(text):
+                    return self.lint(body=text, EVENT=event, COMMITS=json.dumps([
+                        {"message": "ci: add scaffold\n\n" + text}
+                    ]))
+                result = check(body)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertNotEqual(check(body + "<!-- service." + "internal -->").returncode, 0)
+                self.assertNotEqual(check(body.replace("Title:", "Title: service." + "internal")).returncode, 0)
+
+    def test_github_paths_do_not_hide_private_hosts_or_addresses(self):
+        texts = ["service." + "internal", "local" + "host"]
+        texts.extend(".".join(map(str, address)) for address in (
+            (10, 1, 2, 3), (172, 16, 1, 2), (192, 168, 1, 2), (127, 0, 0, 1)
+        ))
+        for text in texts:
+            with self.subTest(text=text):
+                url = "https://github.com/org/repo/blob/main/" + text
+                self.assertNotEqual(self.lint(body="## Verification\n- See " + url).returncode, 0)
+                self.assertNotEqual(self.lint(EVENT="push", COMMITS=json.dumps([
+                    {"message": "ci: add scaffold\n\nSee " + url}
+                ])).returncode, 0)
+        body = "## Verification\n- See https://github.com/org/repo/blob/main/README.md"
+        self.assertEqual(self.lint(body=body).returncode, 0)
+        body = "## Verification\n- See https://github.com/org/repo/ABC/issues/1"
+        self.assertEqual(self.lint(body=body).returncode, 0)
+
     def test_push_scans_private_references_even_in_merge_and_revert_commits(self):
         for message in ("ci: update QAX-" + "123", "ci: update\n\nservice." + "internal",
                         "Merge branch QAX-" + "123", 'Revert "ci: update QAX-' + '123"'):

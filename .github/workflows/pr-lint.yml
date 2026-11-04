@@ -113,7 +113,8 @@ jobs:
                   hits.append("a tracker id")
               scrubbed = GITHUB_URL.sub("", text or "")
               for pat, label in STRICT_FIXED:
-                  if pat.search(scrubbed) and label not in hits:
+                  value = text if pat is HOST_INTERNAL else scrubbed
+                  if pat.search(value or "") and label not in hits:
                       hits.append(label)
               return hits
 
@@ -129,7 +130,7 @@ jobs:
               return level == "error"
 
           def reference_errors(text, where):
-              text = text.replace(TEMPLATE_HEADER, "", 1)
+              text = text.replace("\r\n", "\n").replace(TEMPLATE_HEADER, "", 1)
               hits = strict_internal_hits(text)
               failed = report_strict(hits, where) if hits else False
               if "a tracker id" not in hits and internal_id_notes(text, where):
