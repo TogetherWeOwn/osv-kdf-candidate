@@ -1,0 +1,243 @@
+name: PR lint
+
+
+on:
+  pull_request:
+    types: [opened, edited, synchronize, reopened, ready_for_review]
+  merge_group:
+  push:
+    branches: [ main ]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pr-lint-${{ github.event.pull_request.number || github.sha }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  REQUIRE_CARD_REF: "false"
+  INTERNAL_ID_LEVEL: "error" # "warning" downgrades; internal ids are banned in every repo
+  INTERNAL_ID_PREFIXES: "TWO,TOG,PAP,PAPA" # empty means a generic ticket-like pattern
+  STRICT_INTERNAL_LEVEL: "error" # fail-closed strict public-text gate; "warning" downgrades it
+  PR_STANDARDS_MODE: "error"
+
+jobs:
+  pr-lint:
+    name: pr-lint
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Check title, body and commits
+        env:
+          EVENT: ${{ github.event_name }}
+          TITLE: ${{ github.event.pull_request.title }}
+          BODY: ${{ github.event.pull_request.body }}
+          AUTHOR: ${{ github.event.pull_request.user.login }}
+          COMMITS: ${{ toJSON(github.event.commits) }}
+        run: |-
+          python3 - <<'PYEOF'
+          import ipaddress, json, os, re, sys
+
+          TYPES = "feat|fix|perf|refactor|test|docs|build|ci|chore|revert|style|security"
+          HEADER = re.compile(rf"^({TYPES})(\([A-Za-z0-9._/,-]+\))?!?: \S.*$")
+          def build_internal_id():
+              raw = (os.environ.get("INTERNAL_ID_PREFIXES") or "").strip()
+              if raw:
+                  parts = [p.strip() for p in re.split(r"[,\s|]+", raw) if p.strip()]
+                  if parts:
+                      return (re.compile(r"\b(" + "|".join(re.escape(p) for p in parts) + r")-\d+\b", re.IGNORECASE),
+                              True)
+              return re.compile(r"\b[A-Z]{2,10}-\d+\b"), False
+          INTERNAL_ID, HAVE_PREFIXES = build_internal_id()
+          UI_LINK_BARE = re.compile(r"(?<![\w.-])/[A-Z]{2,6}/(issues|agents|projects|approvals|runs)/")
+          UI_LINK_HOST = re.compile(r"(?:https?://[^\s/<>()]+|(?<![\w./-])[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+(?::\d+)?)/[A-Z]{2,6}/(issues|agents|projects|approvals|runs)/")
+          HOST_INTERNAL = re.compile(r"\b(?:localhost|[a-z0-9-]+\.(?:internal|local)|(?:10|127)\.\d{1,3}\.\d{1,3}\.\d{1,3}|192\.168\.\d{1,3}\.\d{1,3}|172\.(?:1[6-9]|2\d|3[01])\.\d{1,3}\.\d{1,3})\b", re.IGNORECASE)
+          IPV4_LITERAL = re.compile(r"(?<![\w.])(?:\d{1,3}\.){3}\d{1,3}(?!\w)")
+          IPV6_LITERAL = re.compile(r"(?<!\w)[0-9a-f:.]*:[0-9a-f:.]*:[0-9a-f:.]*(?:%[\w.~-]+)?(?!\w)", re.IGNORECASE)
+          PRIVATE_NETWORKS = tuple(ipaddress.ip_network(cidr) for cidr in (
+              "fc00::/7", "fe80::/10", "fec0::/10", "::/128", "::1/128",
+              "10.0.0.0/8", "127.0.0.0/8", "169.254.0.0/16",
+              "172.16.0.0/12", "192.168.0.0/16", "0.0.0.0/32",
+          ))
+          GITHUB_URL = re.compile(r"(?:https?://|(?<![\w.-]))(?:www\.)?github\.com/[A-Za-z0-9_.~%/\-]*", re.IGNORECASE)
+          STRICT_FIXED = [(UI_LINK_BARE, "an instance UI link"), (UI_LINK_HOST, "an instance UI link"), (HOST_INTERNAL, "the internal host")]
+          HELP = ("Expected a Conventional Commits header, e.g. 'fix(auth): refuse expired sudo "
+                  "sessions'. Allowed types: " + TYPES.replace("|", ", ") + ".")
+
+          LIGHT = {"docs", "chore", "build", "ci", "style", "test", "revert"}
+          SECTIONS = [
+              ("Linked Issues or Issue Description", 1, True),
+              ("Verification", 1, False),
+          ]
+
+          def parse_sections(text):
+              out, cur, buf = {}, None, []
+              for line in text.splitlines():
+                  m = re.match(r"^##\s+(.+?)\s*#*\s*$", line)
+                  if m:
+                      if cur is not None:
+                          out[cur] = "\n".join(buf)
+                      cur, buf = m.group(1).strip().lower(), []
+                  elif cur is not None:
+                      buf.append(line)
+              if cur is not None:
+                  out[cur] = "\n".join(buf)
+              return out
+
+          def real_items(content):
+              n = 0
+              for raw in content.splitlines():
+                  line = re.sub(r"^\s*(?:>\s*)*(?:[-*]\s+|\d+[.)]\s+)?", "", raw).strip()
+                  if len(line) < 6 or re.fullmatch(r"\[[^\]]*\]", line) or line.endswith((" ...", " …")):
+                      continue
+                  n += 1
+              return n
+
+          def header_errors(text):
+              errs = []
+              if not HEADER.match(text):
+                  errs.append("not a Conventional Commits header")
+              if len(text) > 100:
+                  errs.append(f"{len(text)} chars (max 100)")
+              if text.rstrip().endswith("."):
+                  errs.append("ends with a period")
+              return errs
+
+          def internal_id_notes(text, where):
+              if INTERNAL_ID.search(text or ""):
+                  level = "error" if os.environ.get("INTERNAL_ID_LEVEL") == "error" else "warning"
+                  print(f"::{level} title=Internal id in {where}::" +
+                        "Keep internal ticket ids out of public PR text.")
+                  return level == "error"
+              return False
+
+          def strict_internal_hits(text):
+              """Fail-closed strict subset for public title/body. Labels only, never values."""
+              hits = []
+              require_card = os.environ.get("REQUIRE_CARD_REF") == "true"
+              if HAVE_PREFIXES and not require_card and INTERNAL_ID.search(text or ""):
+                  hits.append("a tracker id")
+              addresses = []
+              def classify_ipv6(match):
+                  literal = match.group()
+                  # A hostname suffix means this is not a whole address token.
+                  if (text or "")[match.end():].startswith("."):
+                      return literal
+                  # Parse intact first: trailing double colons can belong to the address.
+                  for candidate in (literal.rstrip("."), literal.rstrip(".").removesuffix(":")):
+                      try:
+                          address = ipaddress.IPv6Address(candidate)
+                      except ValueError:
+                          continue
+                      addresses.append(address)
+                      # Neither independent matcher may reclassify a valid IPv6 tail.
+                      return " " * len(literal)
+                  return literal
+              address_text = IPV6_LITERAL.sub(classify_ipv6, text or "")
+              scrubbed = GITHUB_URL.sub("", text or "")
+              for pat, label in STRICT_FIXED:
+                  value = address_text if pat is HOST_INTERNAL else scrubbed
+                  if pat.search(value or "") and label not in hits:
+                      hits.append(label)
+              for literal in IPV4_LITERAL.findall(address_text):
+                  try:
+                      addresses.append(ipaddress.IPv4Address(literal))
+                  except ValueError:
+                      pass
+              for address in addresses:
+                  address = getattr(address, "ipv4_mapped", None) or address
+                  if any(address in network for network in PRIVATE_NETWORKS):
+                      hits.append("a private-network address")
+                      break
+              return hits
+
+          def report_strict(hits, where):
+              raw = (os.environ.get("STRICT_INTERNAL_LEVEL") or "").strip().lower()
+              level = "warning" if raw in ("warning", "warn") else "error"
+              if "a tracker id" in hits and os.environ.get("INTERNAL_ID_LEVEL") == "error":
+                  level = "error"
+              print(f"::{level} title=Strict internal ref in {where}::The PR {where} holds " +
+                    f"{', '.join(hits)}. Public PR text carries no tracker ids, instance " +
+                    "links or internal hosts: say it in plain words and link only public " +
+                    "GitHub issues.")
+              return level == "error"
+
+          def reference_errors(text, where):
+              text = text.replace("\r\n", "\n").replace(TEMPLATE_HEADER, "", 1)
+              hits = strict_internal_hits(text)
+              failed = report_strict(hits, where) if hits else False
+              if "a tracker id" not in hits and internal_id_notes(text, where):
+                  failed = True
+              return failed
+
+          TEMPLATE_HEADER = (
+              "<!--\n"
+              "Title: Conventional Commits header, e.g. `fix(auth): refuse expired sudo sessions`.\n"
+              "Types: feat fix perf refactor test docs build ci chore revert style security. ≤100 chars, no trailing period.\n"
+              "In every repo, public or private: no internal ticket ids, instance links, localhost or private-network\n"
+              "addresses in title, body, commits or branch. Link only public GitHub issues (`Fixes #123`); link the card\n"
+              "from the tracker side. The required pr-standards check enforces this.\n"
+              "Rules: https://github.com/TogetherWeOwn/.github/blob/main/CONTRIBUTING.md\n"
+              "Open as draft; mark ready when complete. Batch fixes per review round.\n"
+              "-->"
+          )
+
+          mode = os.environ.get("PR_STANDARDS_MODE", "warn")
+          strict = mode == "error"
+          failed = False
+          if os.environ.get("EVENT") == "pull_request":
+              title = (os.environ.get("TITLE") or "").strip()
+              body = os.environ.get("BODY") or ""
+              author = os.environ.get("AUTHOR") or ""
+              for where, value in (("the title", title), ("the body", body)):
+                  if reference_errors(value, where):
+                      failed = True
+              errs = header_errors(title)
+              if author.endswith("[bot]") and author.startswith(("dependabot", "renovate")):
+                  if errs:
+                      print(f"::warning title=Dependency-bot title::{'; '.join(errs)}. {HELP}")
+                  sys.exit(1 if failed else 0)
+              if errs:
+                  failed = True
+                  print(f"::error title=PR title::{'; '.join(errs)}. {HELP}")
+              text = re.sub(r"<!--.*?-->", "", body, flags=re.S)
+              if len(re.sub(r"\s", "", text)) < 40:
+                  if strict:
+                      failed = True
+                      print("::error title=PR body::The description is empty. Say what changed, "
+                            "why, and how it was tested.")
+                  else:
+                      print("::warning title=PR body::The description looks empty.")
+              kind = re.match(rf"^({TYPES})", title)
+              light = bool(kind) and kind.group(1) in LIGHT
+              sections = parse_sections(text)
+              for name, minimum, skip_light in SECTIONS:
+                  if skip_light and light:
+                      continue
+                  if real_items(sections.get(name.lower(), "")) < minimum:
+                      if strict:
+                          failed = True
+                      print(f"::{'error' if strict else 'warning'} title=PR body::Section '## {name}' "
+                            f"is missing or has fewer than {minimum} real item(s). Follow the PR template.")
+              if os.environ.get("REQUIRE_CARD_REF") == "true" and not INTERNAL_ID.search(body):
+                  failed = True
+                  print("::error title=Card reference::Add 'Refs: <card-id>' to the PR body.")
+          else:
+              for c in json.loads(os.environ.get("COMMITS") or "[]") or []:
+                  message = c.get("message") or ""
+                  if reference_errors(message, "commit text"):
+                      failed = True
+                  subject = message.splitlines()[0] if message else ""
+                  if subject.startswith(("Merge ", "Revert \"")):
+                      continue
+                  errs = header_errors(subject)
+                  if errs:
+                      failed = True
+                      print("::error title=Commit on default branch::"
+                            f"{'; '.join(errs)}. Merge PRs with squash and the PR title as the "
+                            "commit title.")
+          if failed:
+              sys.exit(1)
+          print("PR conventions OK")
+          PYEOF

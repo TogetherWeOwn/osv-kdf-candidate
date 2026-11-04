@@ -1,0 +1,43 @@
+# Advisory only: fork PRs have read-only tokens, so labels may be skipped.
+name: pr-size
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+  schedule:
+    - cron: '17 7 * * 1'
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: "Optional PR number to label now (blank runs the weekly tally)"
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.event.pull_request.number || inputs.pr_number || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  pr-size:
+    name: pr-size
+    if: github.event_name == 'pull_request' || inputs.pr_number != ''
+    permissions:
+      contents: read
+      issues: write
+      pull-requests: write
+    uses: TogetherWeOwn/.github/.github/workflows/pr-size.yml@97fc0e24038021dfaa1fc9da754c6c5d6429130f
+    with:
+      pr-number: ${{ inputs.pr_number || '' }}
+      exclude-extra: ""
+
+  pr-size-weekly:
+    name: pr-size-weekly
+    if: github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.pr_number == '')
+    permissions:
+      contents: read
+      issues: read
+      pull-requests: read
+    uses: TogetherWeOwn/.github/.github/workflows/pr-size-weekly.yml@97fc0e24038021dfaa1fc9da754c6c5d6429130f
