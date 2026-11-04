@@ -185,6 +185,36 @@ class PrLintTests(unittest.TestCase):
         body = "## Verification\n- See https://github.com/org/repo/ABC/issues/1"
         self.assertEqual(self.lint(body=body).returncode, 0)
 
+    def test_private_ipv6_references_fail_in_pr_and_commit_text(self):
+        addresses = ("fd00::1234", "::1", "fe80::1234", "FC00:0:0:0:0:0:0:1",
+                     "fe80::1234%eth0", "::ffff:" + "127.0.0.1")
+        for address in addresses:
+            for text in ("https://[" + address + "]/status", address):
+                for event in ("pull_request", "push"):
+                    with self.subTest(address=address, text=text, event=event):
+                        result = self.lint(
+                            body="## Verification\n- Validation passed for " + text,
+                            EVENT=event, COMMITS=json.dumps([
+                                {"message": "ci: add scaffold\n\nSee " + text}
+                            ]),
+                        )
+                        self.assertNotEqual(result.returncode, 0)
+                        self.assertIn("::error", result.stdout)
+                        self.assertNotIn(address, result.stdout)
+
+    def test_public_ipv6_and_github_links_pass_in_pr_and_commit_text(self):
+        for text in ("https://[2606:4700:4700::1111]/status",
+                     "2001:4860:4860::8888", "https://github.com/org/repo/issues/1"):
+            for event in ("pull_request", "push"):
+                with self.subTest(text=text, event=event):
+                    result = self.lint(
+                        body="## Verification\n- Validation passed for " + text,
+                        EVENT=event, COMMITS=json.dumps([
+                            {"message": "ci: add scaffold\n\nSee " + text}
+                        ]),
+                    )
+                    self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
     def test_push_scans_private_references_even_in_merge_and_revert_commits(self):
         for message in ("ci: update QAX-" + "123", "ci: update\n\nservice." + "internal",
                         "Merge branch QAX-" + "123", 'Revert "ci: update QAX-' + '123"'):
