@@ -1,0 +1,4 @@
+.claude/
+.paperclip/
+__pycache__/
+*.pyc
